@@ -20,8 +20,7 @@ import (
 	"github.com/hashicorp/errwrap"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/logutils"
-	"github.com/mitchellh/colorstring"
-
+	"github.com/hashicorp/terraform-plugin-sdk/acctest"
 	"github.com/hashicorp/terraform-plugin-sdk/helper/logging"
 	"github.com/hashicorp/terraform-plugin-sdk/internal/addrs"
 	"github.com/hashicorp/terraform-plugin-sdk/internal/command/format"
@@ -32,6 +31,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/internal/states"
 	"github.com/hashicorp/terraform-plugin-sdk/internal/tfdiags"
 	"github.com/hashicorp/terraform-plugin-sdk/terraform"
+	"github.com/mitchellh/colorstring"
 )
 
 // flagSweep is a flag available when running tests on the command line. It
@@ -108,7 +108,15 @@ func TestMain(m *testing.M) {
 			os.Exit(1)
 		}
 	} else {
-		os.Exit(m.Run())
+		exitCode := m.Run()
+
+		if acctest.TestHelper != nil {
+			err := acctest.TestHelper.Close()
+			if err != nil {
+				log.Printf("Error cleaning up temporary test files: %s", err)
+			}
+		}
+		os.Exit(exitCode)
 	}
 }
 
@@ -325,6 +333,11 @@ type TestCase struct {
 	// IDRefreshIgnore is a list of configuration keys that will be ignored.
 	IDRefreshName   string
 	IDRefreshIgnore []string
+
+	// DisableBinaryDriver forces this test case to run using the legacy test
+	// driver, even if the binary test driver has been enabled.
+	// This property will be removed in version 2.0.0 of the SDK.
+	DisableBinaryDriver bool
 }
 
 // TestStep is a single apply sequence of a test, done within the
@@ -548,11 +561,6 @@ func Test(t TestT, c TestCase) {
 		return
 	}
 
-	// Run the PreCheck if we have it
-	if c.PreCheck != nil {
-		c.PreCheck()
-	}
-
 	// get instances of all providers, so we can use the individual
 	// resources to shim the state during the tests.
 	providers := make(map[string]terraform.ResourceProvider)
@@ -562,6 +570,32 @@ func Test(t TestT, c TestCase) {
 			t.Fatal(err)
 		}
 		providers[name] = p
+	}
+
+	if acctest.TestHelper != nil && c.DisableBinaryDriver == false {
+		// auto-configure all providers
+		for _, p := range providers {
+			err = p.Configure(terraform.NewResourceConfigRaw(nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Run the PreCheck if we have it.
+		// This is done after the auto-configure to allow providers
+		// to override the default auto-configure parameters.
+		if c.PreCheck != nil {
+			c.PreCheck()
+		}
+
+		// inject providers for ImportStateVerify
+		RunNewTest(t.(*testing.T), c, providers)
+		return
+	} else {
+		// run the PreCheck if we have it
+		if c.PreCheck != nil {
+			c.PreCheck()
+		}
 	}
 
 	providerResolver, err := testProviderResolver(c)
@@ -844,12 +878,12 @@ func testIDOnlyRefresh(c TestCase, opts terraform.ContextOpts, step TestStep, r 
 	expected := r.Primary.Attributes
 	// Remove fields we're ignoring
 	for _, v := range c.IDRefreshIgnore {
-		for k, _ := range actual {
+		for k := range actual {
 			if strings.HasPrefix(k, v) {
 				delete(actual, k)
 			}
 		}
-		for k, _ := range expected {
+		for k := range expected {
 			if strings.HasPrefix(k, v) {
 				delete(expected, k)
 			}

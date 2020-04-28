@@ -2,6 +2,7 @@ package graph
 
 import (
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -152,9 +153,9 @@ func PasswordCredentialForResource(d *schema.ResourceData) (*graphrbac.PasswordC
 
 func PasswordCredentialResultFindByKeyId(creds graphrbac.PasswordCredentialListResult, keyId string) *graphrbac.PasswordCredential {
 	var cred *graphrbac.PasswordCredential
-
 	if creds.Value != nil {
 		for _, c := range *creds.Value {
+			log.Printf("KeyID: %s, looking for KeyID %s", *c.KeyID, keyId)
 			if c.KeyID == nil {
 				continue
 			}
@@ -164,6 +165,8 @@ func PasswordCredentialResultFindByKeyId(creds graphrbac.PasswordCredentialListR
 				break
 			}
 		}
+	} else {
+		log.Println("creds.Values is null")
 	}
 
 	return cred

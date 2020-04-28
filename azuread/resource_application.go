@@ -61,6 +61,27 @@ func resourceApplication() *schema.Resource {
 				ValidateFunc: validate.URLIsHTTPOrHTTPS,
 			},
 
+			"marketing_url": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Computed:     true,
+				ValidateFunc: validate.URLIsHTTPOrHTTPS,
+			},
+
+			"privacy_statement_url": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Computed:     true,
+				ValidateFunc: validate.URLIsHTTPOrHTTPS,
+			},
+
+			"terms_of_service_url": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				Computed:     true,
+				ValidateFunc: validate.URLIsHTTPOrHTTPS,
+			},
+
 			"identifier_uris": {
 				Type:     schema.TypeList,
 				Optional: true,
@@ -188,7 +209,15 @@ func resourceApplication() *schema.Resource {
 					},
 				},
 			},
-
+			"sign_in_audience": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ValidateFunc: validation.StringInSlice([]string{"AzureADMyOrg", "AzureADMultipleOrgs", "AzureADandPersonalMicrosoftAccount"}, false),
+			},
+			"access_token_accepted_version": {
+				Type:     schema.TypeInt,
+				Optional: true,
+			},
 			"owners": {
 				Type:     schema.TypeSet,
 				Optional: true,
@@ -216,7 +245,8 @@ func resourceApplication() *schema.Resource {
 }
 
 func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*ArmClient).applicationsClient
+	armClient := meta.(*ArmClient)
+	client := armClient.applicationsClient
 	ctx := meta.(*ArmClient).StopContext
 
 	name := d.Get("name").(string)
@@ -234,6 +264,7 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 		ReplyUrls:               tf.ExpandStringSlicePtr(d.Get("reply_urls").(*schema.Set).List()),
 		AvailableToOtherTenants: p.BoolI(d.Get("available_to_other_tenants")),
 		RequiredResourceAccess:  expandADApplicationRequiredResourceAccess(d),
+		InformationalUrls:       &graphrbac.InformationalURL{},
 	}
 
 	if v, ok := d.GetOk("homepage"); ok {
@@ -243,6 +274,18 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 		if appType != "native" {
 			properties.Homepage = p.String(fmt.Sprintf("https://%s", name))
 		}
+	}
+
+	if v, ok := d.GetOk("terms_of_service_url"); ok {
+		properties.InformationalUrls.TermsOfService = p.StringI(v)
+	}
+
+	if v, ok := d.GetOk("marketing_url"); ok {
+		properties.InformationalUrls.Marketing = p.StringI(v)
+	}
+
+	if v, ok := d.GetOk("privacy_statement_url"); ok {
+		properties.InformationalUrls.Privacy = p.StringI(v)
 	}
 
 	if v, ok := d.GetOk("logout_url"); ok {
@@ -261,7 +304,31 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 		properties.GroupMembershipClaims = graphrbac.GroupMembershipClaimTypes(v.(string))
 	}
 
-	app, err := client.Create(ctx, properties)
+	log.Printf("[DEBUG] Use MS graph API ? %t", armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources)
+	var app graphrbac.Application
+	var err error
+	if armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		var accessTokenAcceptedVersion *int
+		var owners []string
+		if v, ok := d.GetOk("signInAudience"); ok {
+			properties.SignInAudience = p.StringI(v)
+		}
+		if v, ok := d.GetOk("accessTokenAcceptedVersion"); ok {
+			tmpATAV := int(*p.Int32I(v))
+			accessTokenAcceptedVersion = &tmpATAV
+		}
+		if v, ok := d.GetOk("owners"); ok {
+			owners = *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
+		}
+
+		properties.AppRoles = expandADApplicationAppRoles(d.Get("app_role"))
+
+		log.Printf("Using MSGraphAPI to create application")
+		app, err = armClient.graphClient.Create(ctx, properties, accessTokenAcceptedVersion, owners)
+	} else {
+		app, err = client.Create(ctx, properties)
+	}
+
 	if err != nil {
 		return err
 	}
@@ -271,43 +338,49 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 	d.SetId(*app.ObjectID)
 
 	_, err = graph.WaitForCreationReplication(func() (interface{}, error) {
+		if armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+			return armClient.graphClient.Get(ctx, *app.ObjectID)
+		}
+
 		return client.Get(ctx, *app.ObjectID)
 	})
 	if err != nil {
 		return fmt.Errorf("Error waiting for Application with ObjectId %q: %+v", *app.ObjectID, err)
 	}
 
-	// follow suggested hack for azure-cli
-	// AAD graph doesn't have the API to create a native app, aka public client, the recommended hack is
-	// to create a web app first, then convert to a native one
-	if appType == "native" {
-		properties := graphrbac.ApplicationUpdateParameters{
-			Homepage:       nil,
-			IdentifierUris: &[]string{},
-			PublicClient:   p.Bool(true),
-		}
-		if _, err := client.Patch(ctx, *app.ObjectID, properties); err != nil {
-			return err
-		}
-	}
-
-	// to use an empty value we need to patch the resource
-	appRoles := expandADApplicationAppRoles(d.Get("app_role"))
-	if appRoles != nil {
-		properties2 := graphrbac.ApplicationUpdateParameters{
-			AppRoles: appRoles,
+	if !armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		// follow suggested hack for azure-cli
+		// AAD graph doesn't have the API to create a native app, aka public client, the recommended hack is
+		// to create a web app first, then convert to a native one
+		if appType == "native" {
+			properties := graphrbac.ApplicationUpdateParameters{
+				Homepage:       nil,
+				IdentifierUris: &[]string{},
+				PublicClient:   p.Bool(true),
+			}
+			if _, err := client.Patch(ctx, *app.ObjectID, properties); err != nil {
+				return err
+			}
 		}
 
-		if _, err := client.Patch(ctx, *app.ObjectID, properties2); err != nil {
-			return err
-		}
-	}
+		// to use an empty value we need to patch the resource
+		appRoles := expandADApplicationAppRoles(d.Get("app_role"))
+		if appRoles != nil {
+			properties2 := graphrbac.ApplicationUpdateParameters{
+				AppRoles: appRoles,
+			}
 
-	// zadd owners, there is a default owner that we must account so use this shared function
-	if v, ok := d.GetOk("owners"); ok {
-		members := *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
-		if err := adApplicationSetOwnersTo(client, ctx, *app.ObjectID, members); err != nil {
-			return err
+			if _, err := client.Patch(ctx, *app.ObjectID, properties2); err != nil {
+				return err
+			}
+		}
+
+		// zadd owners, there is a default owner that we must account so use this shared function
+		if v, ok := d.GetOk("owners"); ok {
+			members := *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
+			if err := adApplicationSetOwnersTo(client, ctx, *app.ObjectID, members); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -315,7 +388,8 @@ func resourceApplicationCreate(d *schema.ResourceData, meta interface{}) error {
 }
 
 func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*ArmClient).applicationsClient
+	armClient := meta.(*ArmClient)
+	client := armClient.applicationsClient
 	ctx := meta.(*ArmClient).StopContext
 
 	name := d.Get("name").(string)
@@ -358,7 +432,7 @@ func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
 		properties.RequiredResourceAccess = expandADApplicationRequiredResourceAccess(d)
 	}
 
-	if d.HasChange("app_role") {
+	if d.HasChange("app_role") && !armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
 		// if the app role already exists then it must be disabled
 		// with no other changes before it can be edited or deleted
 		var app graphrbac.Application
@@ -401,14 +475,30 @@ func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 	}
 
-	if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
-		return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
-	}
+	if armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		var desiredOwners []string
+		if v, ok := d.GetOkExists("owners"); ok && d.HasChange("owners") {
+			desiredOwners = *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
+		}
 
-	if v, ok := d.GetOkExists("owners"); ok && d.HasChange("owners") {
-		desiredOwners := *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
-		if err := adApplicationSetOwnersTo(client, ctx, d.Id(), desiredOwners); err != nil {
-			return err
+		var accessTokenAcceptedVersion *int
+		if d.HasChange("required_resource_access") {
+
+		}
+
+		if _, err := armClient.graphClient.Patch(ctx, d.Id(), properties, accessTokenAcceptedVersion, desiredOwners); err != nil {
+			return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
+		}
+	} else {
+		if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
+			return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
+		}
+
+		if v, ok := d.GetOkExists("owners"); ok && d.HasChange("owners") {
+			desiredOwners := *tf.ExpandStringSlicePtr(v.(*schema.Set).List())
+			if err := adApplicationSetOwnersTo(client, ctx, d.Id(), desiredOwners); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -416,10 +506,18 @@ func resourceApplicationUpdate(d *schema.ResourceData, meta interface{}) error {
 }
 
 func resourceApplicationRead(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*ArmClient).applicationsClient
-	ctx := meta.(*ArmClient).StopContext
+	armClient := meta.(*ArmClient)
+	client := armClient.applicationsClient
+	ctx := armClient.StopContext
 
-	app, err := client.Get(ctx, d.Id())
+	var app graphrbac.Application
+	var err error
+	if armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		app, err = armClient.graphClient.Get(ctx, d.Id())
+	} else {
+		app, err = client.Get(ctx, d.Id())
+	}
+
 	if err != nil {
 		if ar.ResponseWasNotFound(app.Response) {
 			log.Printf("[DEBUG] Azure AD Application with ID %q was not found - removing from state", d.Id())
@@ -469,41 +567,52 @@ func resourceApplicationRead(d *schema.ResourceData, meta interface{}) error {
 		return fmt.Errorf("Error setting `oauth2_permissions`: %+v", err)
 	}
 
-	owners, err := graph.ApplicationAllOwners(client, ctx, d.Id())
-	if err != nil {
-		return fmt.Errorf("Error getting owners for Application %q: %+v", *app.ObjectID, err)
-	}
-	if err := d.Set("owners", owners); err != nil {
-		return fmt.Errorf("Error setting `owners`: %+v", err)
+	if !armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		owners, err := graph.ApplicationAllOwners(client, ctx, d.Id())
+		if err != nil {
+			return fmt.Errorf("Error getting owners for Application %q: %+v", *app.ObjectID, err)
+		}
+		if err := d.Set("owners", owners); err != nil {
+			return fmt.Errorf("Error setting `owners`: %+v", err)
+		}
 	}
 
 	return nil
 }
 
 func resourceApplicationDelete(d *schema.ResourceData, meta interface{}) error {
-	client := meta.(*ArmClient).applicationsClient
+	armClient := meta.(*ArmClient)
+	client := armClient.applicationsClient
 	ctx := meta.(*ArmClient).StopContext
 
-	// in order to delete an application which is available to other tenants, we first have to disable this setting
-	availableToOtherTenants := d.Get("available_to_other_tenants").(bool)
-	if availableToOtherTenants {
-		log.Printf("[DEBUG] Azure AD Application is available to other tenants - disabling that feature before deleting.")
-		properties := graphrbac.ApplicationUpdateParameters{
-			AvailableToOtherTenants: p.Bool(false),
+	if armClient.userFeatures.MSGraphAPI.IsEnabledForExistingResources {
+		resp, err := armClient.graphClient.Delete(ctx, d.Id())
+		if err != nil {
+			if !ar.ResponseWasNotFound(resp) {
+				return fmt.Errorf("Error Deleting Azure AD Application with ID %q: %+v", d.Id(), err)
+			}
+		}
+	} else {
+		// in order to delete an application which is available to other tenants, we first have to disable this setting
+		availableToOtherTenants := d.Get("available_to_other_tenants").(bool)
+		if availableToOtherTenants {
+			log.Printf("[DEBUG] Azure AD Application is available to other tenants - disabling that feature before deleting.")
+			properties := graphrbac.ApplicationUpdateParameters{
+				AvailableToOtherTenants: p.Bool(false),
+			}
+
+			if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
+				return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
+			}
 		}
 
-		if _, err := client.Patch(ctx, d.Id(), properties); err != nil {
-			return fmt.Errorf("Error patching Azure AD Application with ID %q: %+v", d.Id(), err)
+		resp, err := client.Delete(ctx, d.Id())
+		if err != nil {
+			if !ar.ResponseWasNotFound(resp) {
+				return fmt.Errorf("Error Deleting Azure AD Application with ID %q: %+v", d.Id(), err)
+			}
 		}
 	}
-
-	resp, err := client.Delete(ctx, d.Id())
-	if err != nil {
-		if !ar.ResponseWasNotFound(resp) {
-			return fmt.Errorf("Error Deleting Azure AD Application with ID %q: %+v", d.Id(), err)
-		}
-	}
-
 	return nil
 }
 

@@ -67,6 +67,34 @@ func Provider() terraform.ResourceProvider {
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("ARM_MSI_ENDPOINT", ""),
 			},
+
+			// Manage features
+			"features": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"msgraphapi": {
+							Type:     schema.TypeList,
+							Optional: true,
+							MaxItems: 1,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"is_enabled_for_existing_resources": {
+										Type:     schema.TypeBool,
+										Required: true,
+									},
+									"use_beta_endpoint": {
+										Type:     schema.TypeBool,
+										Required: true,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
 		},
 
 		DataSourcesMap: map[string]*schema.Resource{
@@ -121,11 +149,14 @@ func providerConfigure(p *schema.Provider) schema.ConfigureFunc {
 			return nil, fmt.Errorf("Error building AzureAD Client: %s", err)
 		}
 
-		client, err := getArmClient(config, p.TerraformVersion, p.StopContext())
+		// Expends features
+		features := expandFeatures(d.Get("features").([]interface{}))
+
+		client, err := getArmClient(config, features, p.TerraformVersion, p.StopContext())
 		if err != nil {
 			return nil, err
 		}
-
+		client.userFeatures = features
 		client.StopContext = p.StopContext()
 
 		// replaces the context between tests

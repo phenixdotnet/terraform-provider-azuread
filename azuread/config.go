@@ -14,6 +14,7 @@ import (
 	"github.com/hashicorp/go-azure-helpers/authentication"
 	"github.com/hashicorp/go-azure-helpers/sender"
 	"github.com/hashicorp/terraform-plugin-sdk/httpclient"
+	"github.com/terraform-providers/terraform-provider-azuread/azuread/helpers/msgraph"
 	"github.com/terraform-providers/terraform-provider-azuread/version"
 )
 
@@ -36,10 +37,16 @@ type ArmClient struct {
 	groupsClient            graphrbac.GroupsClient
 	servicePrincipalsClient graphrbac.ServicePrincipalsClient
 	usersClient             graphrbac.UsersClient
+
+	// MS Graph API clients
+	graphClient msgraph.ApplicationsClient
+
+	// Features
+	userFeatures UserFeatures
 }
 
 // getArmClient is a helper method which returns a fully instantiated *ArmClient based on the auth Config's current settings.
-func getArmClient(authCfg *authentication.Config, tfVersion string, ctx context.Context) (*ArmClient, error) {
+func getArmClient(authCfg *authentication.Config, userFeatures UserFeatures, tfVersion string, ctx context.Context) (*ArmClient, error) {
 	env, err := authentication.DetermineEnvironment(authCfg.Environment)
 	if err != nil {
 		return nil, err
@@ -80,13 +87,17 @@ func getArmClient(authCfg *authentication.Config, tfVersion string, ctx context.
 	if err != nil {
 		return nil, err
 	}
-
 	client.registerGraphRBACClients(graphEndpoint, authCfg.TenantID, graphAuthorizer)
+
+	client.registerMSGraphAPIClient(authCfg.TenantID)
+	msGraphAPIAuthorizer := msgraph.NewMSGraphAutorizer(client.graphClient.Client)
+	configureClient(&client.graphClient.Client, msGraphAPIAuthorizer, client.terraformVersion)
 
 	return &client, nil
 }
 
 func (c *ArmClient) registerGraphRBACClients(endpoint, tenantID string, authorizer autorest.Authorizer) {
+	// ToDo add support for feature flag msgraph and beta
 	c.applicationsClient = graphrbac.NewApplicationsClientWithBaseURI(endpoint, tenantID)
 	configureClient(&c.applicationsClient.Client, authorizer, c.terraformVersion)
 
@@ -101,6 +112,14 @@ func (c *ArmClient) registerGraphRBACClients(endpoint, tenantID string, authoriz
 
 	c.usersClient = graphrbac.NewUsersClientWithBaseURI(endpoint, tenantID)
 	configureClient(&c.usersClient.Client, authorizer, c.terraformVersion)
+}
+
+func (c *ArmClient) registerMSGraphAPIClient(tenantID string) {
+	version := "v1.0/"
+	if c.userFeatures.MSGraphAPI.UseBetaEndPoint {
+		version = "beta/"
+	}
+	c.graphClient = msgraph.ApplicationsClient{graphrbac.NewWithBaseURI("https://graph.microsoft.com/"+version, tenantID)}
 }
 
 func configureClient(client *autorest.Client, auth autorest.Authorizer, tfVersion string) {
